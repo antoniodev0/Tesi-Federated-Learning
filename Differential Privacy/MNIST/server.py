@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import torchvision
 from torchvision import datasets, transforms
 import time 
+
 class OptimizedCNN(nn.Module):
     def __init__(self):
         super(OptimizedCNN, self).__init__()
@@ -37,7 +38,8 @@ class FedAvgServer(fl.server.strategy.FedAvg):
         self.csv_file = 'server_metrics.csv'
         with open(self.csv_file, mode='w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(["Round", "Test Loss", "Test Accuracy", "Total Epsilon"])
+            writer.writerow(["Round", "Test Loss", "Test Accuracy", "Total Epsilon", "Aggregation Time"])
+        
         # Initialize model and test data
         self.model = OptimizedCNN()
         self.transform = transforms.Compose([
@@ -48,18 +50,19 @@ class FedAvgServer(fl.server.strategy.FedAvg):
         self.test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=32, shuffle=False)
         self.criterion = nn.CrossEntropyLoss()
         self.total_epsilon = None
+        self.aggregation_time = 0.0  # Inizializza il tempo di aggregazione
 
     def aggregate_fit(
         self,
         rnd: int,
         results: List[Tuple[ClientProxy, FitRes]],
         failures: List[BaseException],
-    ) -> Tuple[Optional[Parameters], Dict[str, Scalar], float]:
+    ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
         if not results:
-            return None, {}, 0.0
+            return None, {}
 
-        # Inizio della misurazione del tempo
-        start_time = time.time()
+        # Start the timing using time.perf_counter()
+        start_time = time.perf_counter()
 
         # Convert results
         weights_results = [
@@ -71,9 +74,9 @@ class FedAvgServer(fl.server.strategy.FedAvg):
         # Convert weights to parameters
         parameters_aggregated = self.weights_to_parameters(aggregated_weights)
 
-        # Fine della misurazione del tempo
-        end_time = time.time()
-        aggregation_time = end_time - start_time
+        # End the timing
+        end_time = time.perf_counter()
+        self.aggregation_time = end_time - start_time  # Save the aggregation time
 
         # Collect epsilons from clients
         epsilons = []
@@ -82,21 +85,20 @@ class FedAvgServer(fl.server.strategy.FedAvg):
             if epsilon is not None:
                 epsilons.append(epsilon)
         # Compute total epsilon
-        if epsilons:
-            self.total_epsilon = max(epsilons)  # Using max epsilon as the total epsilon
-        else:
-            self.total_epsilon = None
-        print(f"Round {rnd} - Total Epsilon: {self.total_epsilon}, Aggregation Time: {aggregation_time:.2f}s")
+        self.total_epsilon = max(epsilons) if epsilons else None
 
-        return parameters_aggregated, {}, aggregation_time
+        print(f"Round {rnd} - Total Epsilon: {self.total_epsilon}, Aggregation Time: {self.aggregation_time:.6f}s")
 
-    def evaluate(self, rnd: int, parameters: Parameters, aggregation_time: float) -> Optional[Tuple[float, Dict[str, Scalar]]]:
+        return parameters_aggregated, {}
+
+    def evaluate(self, rnd: int, parameters: Parameters) -> Optional[Tuple[float, Dict[str, Scalar]]]:
         # Convert parameters to weights
         weights = self.parameters_to_weights(parameters)
         # Load weights into the model
         params_dict = zip(self.model.state_dict().keys(), weights)
         state_dict = {k: torch.tensor(v) for k, v in params_dict}
         self.model.load_state_dict(state_dict, strict=True)
+        
         # Evaluate the model on the test dataset
         self.model.eval()
         loss = 0.0
@@ -109,17 +111,25 @@ class FedAvgServer(fl.server.strategy.FedAvg):
                 _, predicted = torch.max(outputs.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
+        
         avg_loss = loss / total
         accuracy = correct / total
 
         print(f"Round {rnd} - Test Loss: {avg_loss:.4f}, Test Accuracy: {accuracy:.4f}")
 
-        # Log metrics to CSV, including aggregation time
+        # Log metrics to CSV, including the aggregation time with higher precision
         with open(self.csv_file, mode='a', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow([rnd, avg_loss, accuracy, self.total_epsilon, aggregation_time])
+            writer.writerow([
+                rnd,
+                avg_loss,
+                accuracy,
+                self.total_epsilon,
+                f"{self.aggregation_time:.6f}"
+            ])
 
         return avg_loss, {"accuracy": accuracy}
+
 
     def weights_to_parameters(self, weights: List[np.ndarray]) -> Parameters:
         return fl.common.ndarrays_to_parameters(weights)
