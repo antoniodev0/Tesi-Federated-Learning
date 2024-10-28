@@ -1,7 +1,7 @@
 import flwr as fl
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 import csv
 import numpy as np
 from typing import List, Tuple, Optional
@@ -40,7 +40,7 @@ def load_shakespeare_test_data(seq_length=100):
 
     dataset = ShakespeareDataset(text, seq_length)
 
-    # Utilizziamo una porzione del dataset per il test
+    # Use a portion of the dataset for testing
     test_size = int(0.1 * len(dataset))
     test_dataset = torch.utils.data.Subset(dataset, range(test_size))
 
@@ -79,23 +79,36 @@ class FedAvgServerWithDP(fl.server.strategy.FedAvg):
         # Initialize the CSV file with headers
         with open(self.csv_file, mode='w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(["Round", "Test Loss", "Test Accuracy", "Total Epsilon"])
+            # Include Aggregation Time in the header
+            writer.writerow(["Round", "Test Loss", "Test Accuracy", "Total Epsilon", "Aggregation Time"])
 
         self.total_epsilon = None  # Variable for epsilon
+        self.aggregation_time = 0.0  # Initialize aggregation_time to 0.0
 
     def aggregate_fit(self, rnd, results, failures):
+        if not results:
+            return None, {}
+
+        # Start timing using high-resolution timer
+        start_time = time.perf_counter()
 
         # Call the super method to perform the actual aggregation
         aggregated_parameters, aggregated_metrics = super().aggregate_fit(rnd, results, failures)
+
+        # End timing
+        end_time = time.perf_counter()
+        self.aggregation_time = end_time - start_time  # Save the aggregation time
 
         # Extract epsilons from client results
         epsilons = [fit_res.metrics["epsilon"] for _, fit_res in results if "epsilon" in fit_res.metrics]
         if epsilons:
             self.total_epsilon = max(epsilons)
 
+        print(f"Round {rnd} - Total Epsilon: {self.total_epsilon}, Aggregation Time: {self.aggregation_time:.6f}s")
+
         # Return only the expected two values
         return aggregated_parameters, aggregated_metrics
-    
+
     def evaluate(self, server_round, parameters):
         # Convert parameters to weights
         weights = self.parameters_to_weights(parameters)
@@ -107,15 +120,21 @@ class FedAvgServerWithDP(fl.server.strategy.FedAvg):
 
         # Evaluate the model on the test set
         test_loss, test_accuracy = self.test(self.model, self.test_loader)
-        print(f"Round {server_round} - Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}, Total Epsilon: {self.total_epsilon}")
 
-        # Write results to the CSV file, now including aggregation_time
+        # Handle aggregation_time being None
+        if self.aggregation_time is not None:
+            aggregation_time_str = f"{self.aggregation_time:.6f}"
+        else:
+            aggregation_time_str = "N/A"
+
+        print(f"Round {server_round} - Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}, Total Epsilon: {self.total_epsilon}, Aggregation Time: {aggregation_time_str}s")
+
+        # Write results to the CSV file, including aggregation_time
         with open(self.csv_file, mode='a', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow([server_round, test_loss, test_accuracy, self.total_epsilon])
+            writer.writerow([server_round, test_loss, test_accuracy, self.total_epsilon, aggregation_time_str])
 
         return test_loss, {"accuracy": test_accuracy}
-
 
     def test(self, model, test_loader):
         criterion = nn.CrossEntropyLoss()
@@ -127,7 +146,7 @@ class FedAvgServerWithDP(fl.server.strategy.FedAvg):
             for inputs, labels in test_loader:
                 outputs = model(inputs)
 
-                # Appiattiamo l'output e i target
+                # Flatten output and targets
                 outputs = outputs.view(-1, outputs.size(2))
                 labels = labels.view(-1)
 
